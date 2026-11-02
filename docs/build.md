@@ -164,14 +164,44 @@ dmesg | grep -i -E "ar0234|vin|cci" | tail -40
 
 ## 5. 抓图
 
+必须先 `-i 0`（VIDIOC_S_INPUT）再设格式，否则 `vin_pipeline_try_format` 报 WARN、S_FMT 返回 Invalid argument。
+
 ```sh
-v4l2-ctl -d /dev/video0 --list-formats-ext
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1200,pixelformat=BA10 \
-  --stream-mmap --stream-skip=10 --stream-count=1 --stream-to=ar0234.raw
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=300   # 看实测 fps
+v4l2-ctl -d /dev/video0 -i 0 --set-fmt-video=width=1920,height=1200,pixelformat=BA10 \
+  --stream-mmap --stream-skip=10 --stream-count=1 --stream-to=ar0234.raw   # 4608000 字节
+v4l2-ctl -d /dev/video0 -i 0 --set-fmt-video=width=1920,height=1200,pixelformat=BA10 \
+  --stream-mmap --stream-count=300                                         # 看实测 fps
 ```
 
-预期帧率：2 lane 约 60 fps，4 lane 约 120 fps。
+实测：2 lane 60.22 fps，4 lane（`make LANES=4`）120.44 fps。调参、取图、主机预览见 [tuning.md](tuning.md)。
+
+ISP 未启用（`isp_used=0`），只有 RAW10（`BA10`，GRBG）可用；`--list-formats` 里的 YUV/RGB 和 `/dev/video0` 上的 brightness/contrast/white_balance 等控件走 ISP，对 RAW 无效。
+
+## 6. 曝光 / 增益 / 帧率
+
+控件在传感器子设备上（名字为 `ar0234` 的 `/dev/v4l-subdev*`），开流前或开流中都能改，下次开流保持：
+
+```sh
+S=/dev/$(basename $(grep -l ar0234 /sys/class/video4linux/v4l-subdev*/name | xargs dirname))
+v4l2-ctl -d $S -l
+v4l2-ctl -d $S -c exposure=$((1100*16))      # 单位：行 ×16；1 行 = 612/45 MHz ≈ 13.6 µs（2 lane）
+v4l2-ctl -d $S -c gain=64                     # 16 = 1×，256 = 16× 模拟增益
+v4l2-ctl -d $S -c vertical_blanking=1232      # 帧长 = 1200 + vblank 行
+```
+
+| 控件 | 范围 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `exposure` | 32 … 1048464（2 … 65529 行） | 8192（512 行 ≈ 7 ms） | 曝光行数 + 5 超过帧长时自动拉长帧，帧率下降 |
+| `gain` | 16 … 256 | 28（≈1.75×） | AND9820 建议 ≥ 1.684× |
+| `vertical_blanking` | 16 … 64335 | 16 | fps = 45 MHz / (612 × (1200 + vblank))（2 lane） |
+
+常用帧率（2 lane）：
+
+| fps | vertical_blanking | 实测 |
+| --- | --- | --- |
+| 60 | 16 | 60.22 |
+| 30 | 1232 | 30.17 |
+| 15 | 3664 | 15.10 |
 
 ## 驱动参数
 

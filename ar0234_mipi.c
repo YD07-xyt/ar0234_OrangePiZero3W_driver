@@ -89,6 +89,54 @@ MODULE_PARM_DESC(test_pattern,
 
 static int ar0234_sensor_vts = AR0234_VTS_1200;
 
+/* VBLANK control range: frame_length_lines = height + vblank */
+#define AR0234_VBLANK_MIN (AR0234_VTS_1200 - 1200)
+#define AR0234_VBLANK_MAX (0xFFFF - 1200)
+
+/*
+ * Default frame rate at load time (vertical_blanking can still change it).
+ * 60 for both lane counts; 4 lane 120 fps needs fps=120.
+ */
+static int fps = 60;
+module_param(fps, int, 0444);
+MODULE_PARM_DESC(fps, "default frame rate (1..max), sets default vertical_blanking");
+
+/* Default exposure ~7 ms (512 lines at 2 lane, same as the old table) */
+#define AR0234_EXP_DEF_LINES (512 * (AR0234_PCLK / (45 * 1000 * 1000)))
+
+static unsigned int ar0234_default_vblank(void)
+{
+	unsigned int vts;
+
+	if (fps <= 0 || fps >= SENSOR_FRAME_RATE)
+		return AR0234_VBLANK_MIN;
+	/*
+	 * Scale from the measured max rate (VTS 1216 -> 60.22 / 120.44 fps)
+	 * instead of pclk/(hts*fps): the latter gave 59.90 fps for fps=60.
+	 */
+	vts = AR0234_VTS_1200 * SENSOR_FRAME_RATE / fps;
+	if (vts > 0xFFFF)
+		vts = 0xFFFF;
+	return vts - 1200 > AR0234_VBLANK_MIN ? vts - 1200 : AR0234_VBLANK_MIN;
+}
+
+/*
+ * Driver state wraps sensor_info (first member, so to_state() and the
+ * kfree(to_state(sd)) in sensor_remove still work).
+ */
+struct ar0234_state {
+	struct sensor_info info;
+	unsigned int vblank;
+	struct v4l2_ctrl *exp_ctrl;
+	struct v4l2_ctrl *gain_ctrl;
+	struct v4l2_ctrl *vblank_ctrl;
+};
+
+static struct ar0234_state *to_ar0234(struct sensor_info *info)
+{
+	return container_of(info, struct ar0234_state, info);
+}
+
 /*
  * Default registers: soft reset, PLL/MIPI (24 MHz in, 450 MHz link, 10-bit),
  * lane count, common init, pixclk-specific settings.
@@ -207,53 +255,70 @@ static u16 ar0234_gain_to_reg(int gain_val)
 	return (s << 4) | t;
 }
 
-static int sensor_s_gain(struct v4l2_subdev *sd, int gain_val)
+/* Registers are only written while streaming; sensor_reg_init replays them. */
+static bool ar0234_streaming(struct sensor_info *info)
 {
-	struct sensor_info *info = to_state(sd);
+	return info->stream_count > 0;
+}
+
+static void ar0234_write_gain(struct v4l2_subdev *sd, int gain_val)
+{
 	u16 ana = ar0234_gain_to_reg(gain_val);
 
 	sensor_write(sd, AR0234_REG_MFR_30BA, ar0234_mfr_30ba(ana));
 	sensor_write(sd, AR0234_REG_ANALOG_GAIN, ana);
-
-	info->gain = gain_val;
-	return 0;
 }
 
-static int sensor_g_gain(struct v4l2_subdev *sd, __s32 *value)
+static int sensor_s_gain(struct v4l2_subdev *sd, int gain_val)
 {
 	struct sensor_info *info = to_state(sd);
 
-	*value = info->gain;
+	info->gain = gain_val;
+	if (ar0234_streaming(info))
+		ar0234_write_gain(sd, gain_val);
 	return 0;
 }
 
-/* exp_val is in lines, Q4 */
-static int sensor_s_exp(struct v4l2_subdev *sd, unsigned int exp_val)
+/*
+ * exp_val is in lines, Q4. frame_length_lines = height + vblank, and is
+ * stretched when the exposure needs more lines (lower fps).
+ */
+static void ar0234_write_exp(struct v4l2_subdev *sd, unsigned int exp_val)
 {
 	struct sensor_info *info = to_state(sd);
 	unsigned int shutter = exp_val >> 4;
-	unsigned int frame_length = ar0234_sensor_vts;
+	unsigned int frame_length = info->current_wins ?
+		info->current_wins->height + to_ar0234(info)->vblank :
+		ar0234_sensor_vts;
 
 	if (shutter < AR0234_EXP_MIN)
 		shutter = AR0234_EXP_MIN;
 	if (shutter > 0xFFFF - AR0234_FLL_OVERHEAD - 1)
 		shutter = 0xFFFF - AR0234_FLL_OVERHEAD - 1;
-	/* long exposure stretches the frame (lower fps) */
-	if (shutter + 1 > frame_length)
-		frame_length = shutter + 1;
+	if (shutter + AR0234_FLL_OVERHEAD > frame_length)
+		frame_length = shutter + AR0234_FLL_OVERHEAD;
 
 	sensor_write(sd, AR0234_REG_FRAME_LENGTH_LINES, frame_length);
 	sensor_write(sd, AR0234_REG_COARSE_INTEG_TIME, shutter);
-
-	info->exp = exp_val;
-	return 0;
 }
 
-static int sensor_g_exp(struct v4l2_subdev *sd, __s32 *value)
+static int sensor_s_exp(struct v4l2_subdev *sd, unsigned int exp_val)
 {
 	struct sensor_info *info = to_state(sd);
 
-	*value = info->exp;
+	info->exp = exp_val;
+	if (ar0234_streaming(info))
+		ar0234_write_exp(sd, exp_val);
+	return 0;
+}
+
+static int sensor_s_vblank(struct v4l2_subdev *sd, unsigned int vblank)
+{
+	struct sensor_info *info = to_state(sd);
+
+	to_ar0234(info)->vblank = vblank;
+	if (ar0234_streaming(info))
+		ar0234_write_exp(sd, info->exp);
 	return 0;
 }
 
@@ -360,10 +425,11 @@ static int sensor_init(struct v4l2_subdev *sd, u32 val)
 	info->height = 1200;
 	info->hflip = 0;
 	info->vflip = 0;
-	info->gain = 0;
+	/* keep info->exp / info->gain: VIN calls init on every S_INPUT */
 
 	info->tpf.numerator = 1;
-	info->tpf.denominator = SENSOR_FRAME_RATE;
+	info->tpf.denominator = (fps > 0 && fps < SENSOR_FRAME_RATE) ?
+				fps : SENSOR_FRAME_RATE;
 
 	info->preview_first_flag = 1;
 
@@ -466,6 +532,10 @@ static int sensor_reg_init(struct sensor_info *info)
 	info->height = wsize->height;
 	ar0234_sensor_vts = wsize->vts;
 
+	/* replay exposure / gain / frame length set while not streaming */
+	ar0234_write_exp(sd, info->exp);
+	ar0234_write_gain(sd, info->gain);
+
 	if (test_pattern)
 		sensor_write(sd, AR0234_REG_TEST_PATTERN_MODE, test_pattern);
 
@@ -507,21 +577,10 @@ static int sensor_g_mbus_config(struct v4l2_subdev *sd, unsigned int pad,
 	return 0;
 }
 
-static int sensor_g_ctrl(struct v4l2_ctrl *ctrl)
-{
-	struct sensor_info *info =
-			container_of(ctrl->handler, struct sensor_info, handler);
-	struct v4l2_subdev *sd = &info->sd;
-
-	switch (ctrl->id) {
-	case V4L2_CID_GAIN:
-		return sensor_g_gain(sd, &ctrl->val);
-	case V4L2_CID_EXPOSURE:
-		return sensor_g_exp(sd, &ctrl->val);
-	}
-	return -EINVAL;
-}
-
+/*
+ * Controls are not VOLATILE: v4l2 core skips s_ctrl for volatile controls
+ * (cluster_changed()), so a volatile exposure/gain was never written.
+ */
 static int sensor_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct sensor_info *info =
@@ -533,6 +592,8 @@ static int sensor_s_ctrl(struct v4l2_ctrl *ctrl)
 		return sensor_s_gain(sd, ctrl->val);
 	case V4L2_CID_EXPOSURE:
 		return sensor_s_exp(sd, ctrl->val);
+	case V4L2_CID_VBLANK:
+		return sensor_s_vblank(sd, ctrl->val);
 	}
 	return -EINVAL;
 }
@@ -540,7 +601,6 @@ static int sensor_s_ctrl(struct v4l2_ctrl *ctrl)
 /* ----------------------------------------------------------------------- */
 
 static const struct v4l2_ctrl_ops sensor_ctrl_ops = {
-	.g_volatile_ctrl = sensor_g_ctrl,
 	.s_ctrl = sensor_s_ctrl,
 };
 
@@ -589,23 +649,31 @@ static struct cci_driver cci_drv[] = {
 static int sensor_init_controls(struct v4l2_subdev *sd, const struct v4l2_ctrl_ops *ops)
 {
 	struct sensor_info *info = to_state(sd);
+	struct ar0234_state *st = to_ar0234(info);
 	struct v4l2_ctrl_handler *handler = &info->handler;
-	struct v4l2_ctrl *ctrl;
 	int ret = 0;
 
-	v4l2_ctrl_handler_init(handler, 2);
+	unsigned int vblank_def = ar0234_default_vblank();
 
-	/* exposure: lines, Q4 */
-	ctrl = v4l2_ctrl_new_std(handler, ops, V4L2_CID_EXPOSURE,
-				 AR0234_EXP_MIN << 4, 65535 * 16, 1,
-				 0x200 << 4);
-	if (ctrl != NULL)
-		ctrl->flags |= V4L2_CTRL_FLAG_VOLATILE;
-	/* analog gain: Q4, 1x..16x */
-	ctrl = v4l2_ctrl_new_std(handler, ops, V4L2_CID_GAIN,
-				 1 * 16, 16 * 16, 1, 28);
-	if (ctrl != NULL)
-		ctrl->flags |= V4L2_CTRL_FLAG_VOLATILE;
+	v4l2_ctrl_handler_init(handler, 3);
+
+	/* exposure: lines, Q4; default ~7 ms (512 lines at 2 lane) */
+	st->exp_ctrl = v4l2_ctrl_new_std(handler, ops, V4L2_CID_EXPOSURE,
+					 AR0234_EXP_MIN << 4,
+					 (0xFFFF - AR0234_FLL_OVERHEAD - 1) << 4,
+					 1, AR0234_EXP_DEF_LINES << 4);
+	/* analog gain: Q4, 1x..16x; default 28 = 1.75x (~R0x3060 0x0E) */
+	st->gain_ctrl = v4l2_ctrl_new_std(handler, ops, V4L2_CID_GAIN,
+					  1 * 16, 16 * 16, 1, 28);
+	/* vblank in lines: fps = pclk / (hts * (1200 + vblank)) */
+	st->vblank_ctrl = v4l2_ctrl_new_std(handler, ops, V4L2_CID_VBLANK,
+					    AR0234_VBLANK_MIN,
+					    AR0234_VBLANK_MAX, 1, vblank_def);
+
+	/* defaults until the first s_ctrl */
+	info->exp = AR0234_EXP_DEF_LINES << 4;
+	info->gain = 28;
+	st->vblank = vblank_def;
 
 	if (handler->error) {
 		ret = handler->error;
@@ -638,11 +706,13 @@ static int sensor_probe(struct i2c_client *client,
 #endif
 {
 	struct v4l2_subdev *sd;
+	struct ar0234_state *st;
 	struct sensor_info *info;
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
-	if (info == NULL)
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	if (st == NULL)
 		return -ENOMEM;
+	info = &st->info;
 	sd = &info->sd;
 
 	if (client)
