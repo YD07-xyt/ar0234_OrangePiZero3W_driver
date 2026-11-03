@@ -1,6 +1,8 @@
 # ar0234_OrangePiZero3W_driver
 ar0234相机的orangepi zero3w(a733) liunx驱动
 
+本项目由ai生成
+
 ## build
 docs/build.md 是构建文档,由ai生成
 
