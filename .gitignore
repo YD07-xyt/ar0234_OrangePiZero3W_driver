@@ -1,3 +1,5 @@
+/captures
+/tools/__pycache__
 # Prerequisites
 *.d
 
